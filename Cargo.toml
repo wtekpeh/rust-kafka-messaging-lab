@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "producer",
+    "consumer",
+]
+resolver = "2"
