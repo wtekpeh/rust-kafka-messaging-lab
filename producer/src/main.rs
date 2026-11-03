@@ -17,8 +17,8 @@ struct GpsTelemetry {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Prepare GPS telemetry.
     let telemetry = GpsTelemetry {
-        event_id: "GPS-RUST-001".to_string(),
-        device_id: "ORBI-001".to_string(),
+        event_id: "GPS-REBALANCE-002".to_string(),
+        device_id: "ORBI-002".to_string(),
         latitude: 5.6037,
         longitude: -0.1870,
         speed_kmh: 42.5,
@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Construct the Kafka record.
     let record = FutureRecord::to("orbi.gps.location")
+        .partition(2)
         .key(&telemetry.device_id)
         .payload(&payload);
 
