@@ -2,6 +2,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use serde::Deserialize;
+use sqlx::PgPool;
 
 #[derive(Debug, Deserialize)]
 struct GpsTelemetry {
@@ -14,6 +15,12 @@ struct GpsTelemetry {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let database_url = std::env::var("DATABASE_URL")?;
+
+    let pool = PgPool::connect(&database_url).await?;
+
+    println!("Connected to PostgreSQL successfully!");
+
     // 1. Configure the Kafka consumer.
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
@@ -52,6 +59,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  Partition: {partition}");
                         println!("  Offset: {offset}");
                         println!("-------------------------");
+
+                        let result = sqlx::query(
+                            r#"
+                            INSERT INTO gps_events (
+                                event_id,
+                                device_id,
+                                latitude,
+                                longitude,
+                                speed_kmh
+                            )
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (event_id) DO NOTHING
+                            "#,
+                        )
+                        .bind(&telemetry.event_id)
+                        .bind(&telemetry.device_id)
+                        .bind(telemetry.latitude)
+                        .bind(telemetry.longitude)
+                        .bind(telemetry.speed_kmh)
+                        .execute(&pool)
+                        .await?;
+
+                        if result.rows_affected() == 1 {
+                            println!("GPS event inserted into PostgreSQL");
+                        } else {
+                            println!("Duplicate GPS event detected — insert skipped");
+                        }
 
                         consumer.commit_message(&message, CommitMode::Sync)?;
 
