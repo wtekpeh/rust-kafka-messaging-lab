@@ -2,7 +2,8 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use serde::Deserialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgQueryResult};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug, Deserialize)]
 struct GpsTelemetry {
@@ -13,13 +14,78 @@ struct GpsTelemetry {
     speed_kmh: f64,
 }
 
+async fn save_gps_event(
+    pool: &PgPool,
+    telemetry: &GpsTelemetry,
+) -> Result<PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO gps_events (
+            event_id,
+            device_id,
+            latitude,
+            longitude,
+            speed_kmh
+        )
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (event_id) DO NOTHING
+        "#,
+    )
+    .bind(&telemetry.event_id)
+    .bind(&telemetry.device_id)
+    .bind(telemetry.latitude)
+    .bind(telemetry.longitude)
+    .bind(telemetry.speed_kmh)
+    .execute(pool)
+    .await
+}
+
+async fn save_gps_event_with_retry(
+    pool: &PgPool,
+    telemetry: &GpsTelemetry,
+) -> Result<PgQueryResult, sqlx::Error> {
+    const MAX_RETRIES: u32 = 3;
+
+    for attempt in 0..=MAX_RETRIES {
+        match save_gps_event(pool, telemetry).await {
+            Ok(result) => return Ok(result),
+
+            Err(error) => {
+                if attempt == MAX_RETRIES {
+                    eprintln!(
+                        "PostgreSQL operation failed after {} attempts: {}",
+                        MAX_RETRIES + 1,
+                        error
+                    );
+
+                    return Err(error);
+                }
+
+                let delay_seconds = 2_u64.pow(attempt);
+
+                eprintln!(
+                    "PostgreSQL error: {}. Retry {}/{} in {} second(s)...",
+                    error,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    delay_seconds
+                );
+
+                sleep(Duration::from_secs(delay_seconds)).await;
+            }
+        }
+    }
+
+    unreachable!("Retry loop must return success or error")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("DATABASE_URL")?;
 
     let pool = PgPool::connect(&database_url).await?;
 
-    println!("Connected to PostgreSQL successfully!");
+    println!("PostgreSQL connection pool initialized (lazy connection)");
 
     // 1. Configure the Kafka consumer.
     let consumer: StreamConsumer = ClientConfig::new()
@@ -60,26 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  Offset: {offset}");
                         println!("-------------------------");
 
-                        let result = sqlx::query(
-                            r#"
-                            INSERT INTO gps_events (
-                                event_id,
-                                device_id,
-                                latitude,
-                                longitude,
-                                speed_kmh
-                            )
-                            VALUES ($1, $2, $3, $4, $5)
-                            ON CONFLICT (event_id) DO NOTHING
-                            "#,
-                        )
-                        .bind(&telemetry.event_id)
-                        .bind(&telemetry.device_id)
-                        .bind(telemetry.latitude)
-                        .bind(telemetry.longitude)
-                        .bind(telemetry.speed_kmh)
-                        .execute(&pool)
-                        .await?;
+                        let result = save_gps_event_with_retry(&pool, &telemetry).await?;
 
                         if result.rows_affected() == 1 {
                             println!("GPS event inserted into PostgreSQL");
