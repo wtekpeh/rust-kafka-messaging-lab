@@ -4,7 +4,7 @@ Hands-on Apache Kafka distributed messaging lab using Rust, Tokio, and rdkafka.
 
 This repository is a progressive learning lab for Kafka's distributed messaging model. The goal is to understand how producers, partitions, consumer groups, and offset management work by implementing and testing them in Rust.
 
-> **Status:** Milestones 1–3 complete — Rust producer and consumer, consumer-group rebalancing, manual offset commits, PostgreSQL persistence, idempotent processing, and crash recovery. This is a learning lab, not a production-ready messaging service.
+> **Status:** Milestones 1–4 complete — Rust producer and consumer, consumer-group rebalancing, manual offset commits, PostgreSQL persistence, idempotent processing, crash recovery, bounded database retries, and dead-letter queue handling. This is a learning lab, not a production-ready messaging service.
 
 ## Technology stack
 
@@ -122,7 +122,7 @@ The `consumer` crate uses `StreamConsumer` to:
 - Persist valid GPS events to PostgreSQL using SQLx.
 - Prevent duplicate database inserts using a unique event ID.
 - Commit Kafka offsets only after successful database processing.
-- Report malformed JSON without treating it as a successfully processed event.
+- Publish malformed JSON to a dead-letter queue and commit the original offset only after successful DLQ delivery.
 
 Run in another terminal:
 
@@ -407,6 +407,142 @@ the consumer can safely recover from this failure without inserting duplicate GP
 
 This demonstrates **at-least-once processing with idempotent database writes**, not universal exactly-once execution of arbitrary side effects.
 
+## Milestone 4 — Database failure recovery and dead-letter queue
+
+This milestone introduces bounded PostgreSQL retries, error classification, explicit Kafka commit failure handling, and dead-letter queue (DLQ) processing.
+
+### PostgreSQL retry strategy
+
+The consumer uses `save_gps_event_with_retry()` to retry selected transient database errors.
+
+- Maximum retries: 3, giving 4 total attempts.
+- Exponential backoff: 1, 2, and 4 seconds.
+- Retryable errors include connection I/O failures, connection-pool timeouts, PostgreSQL serialization failures (`40001`), deadlocks (`40P01`), too many connections (`53300`), and temporarily unavailable database connections (`57P03`).
+- Non-retryable errors, including invalid credentials (`28P01`), stop processing immediately.
+- When all retries fail, the consumer exits without committing the affected Kafka offset.
+
+### Experiment 1 — PostgreSQL outage and recovery
+
+We simulated a database connection failure by configuring an unreachable PostgreSQL port.
+
+The consumer received `GPS-RETRY-001` at partition 1, offset 8.
+
+The database operation failed after four attempts, with exponential backoff between retries.
+
+Kafka consumer-group inspection showed:
+
+| Metric | Before recovery |
+| --- | --- |
+| Partition | 1 |
+| Committed offset | 8 |
+| Log end offset | 9 |
+| Lag | 1 |
+
+After restoring database connectivity and restarting the consumer, Kafka redelivered the event.
+
+The PostgreSQL insert succeeded, and the consumer committed offset 9.
+
+Final inspection confirmed zero lag across all three partitions.
+
+This demonstrated that temporary database failures do not require losing the Kafka event.
+
+### Kafka commit failure handling
+
+The consumer uses synchronous offset commits after successful database processing.
+
+Commit failures are logged with the partition, message offset, and error.
+
+If a commit fails, the consumer exits rather than continuing with uncertain processing progress.
+
+Because PostgreSQL inserts are idempotent, replaying an already-persisted event does not create another database row.
+
+### Dead-letter queue
+
+A separate Kafka topic was created:
+
+`orbi.gps.location.dlq`
+
+Configuration:
+
+- Partitions: 3
+- Replication factor: 1
+- Producer: Rust `FutureProducer`
+- Producer acknowledgment configuration: `acks=all`
+
+When GPS telemetry cannot be deserialized:
+
+1. The consumer records the deserialization error.
+2. The original message payload is published to the DLQ.
+3. Kafka acknowledges the DLQ publication.
+4. The consumer commits the original message's offset.
+5. Normal consumption continues.
+
+If DLQ publication fails, the consumer exits without committing the original offset.
+
+### Experiment 2 — Invalid GPS telemetry
+
+We published `GPS-DLQ-001` with a string value in the numeric `latitude` field.
+
+The consumer rejected the message and published its original payload to the DLQ.
+
+Observed results:
+
+- Original partition: 1
+- Original offset: 9
+- DLQ partition: 2
+- DLQ offset: 0
+- Original committed offset: 10
+
+A Kafka console consumer independently retrieved the original invalid payload from the DLQ.
+
+### Experiment 3 — DLQ diagnostic headers
+
+We extended DLQ records with Kafka headers containing:
+
+- `source_topic`
+- `source_partition`
+- `source_offset`
+- `failure_reason`
+
+We then published `GPS-DLQ-002` with an invalid latitude value.
+
+Kafka console inspection confirmed the following metadata:
+
+| Header | Observed value |
+| --- | --- |
+| `source_topic` | `orbi.gps.location` |
+| `source_partition` | `1` |
+| `source_offset` | `10` |
+| `failure_reason` | Invalid string supplied where `f64` was expected |
+
+The DLQ key was `1-10`, and the original JSON payload was preserved.
+
+The earlier `GPS-DLQ-001` record had no headers because it was published before metadata support was introduced.
+
+### Configuration management
+
+The consumer uses `dotenvy` to load configuration from a local `.env` file.
+
+Database credentials are not hardcoded into Rust source code.
+
+The `.env` file must remain excluded from version control.
+
+### Key learning outcome
+
+The consumer now supports:
+
+- At-least-once Kafka processing.
+- Idempotent PostgreSQL persistence.
+- Bounded retries for selected transient database errors.
+- Fail-fast handling for non-retryable database errors.
+- Explicit Kafka commit failure reporting.
+- Dead-letter queue publication for malformed JSON.
+- Diagnostic headers for investigating failed messages.
+
+This implementation does not provide exactly-once processing across PostgreSQL and Kafka. Duplicate DLQ records remain possible if the consumer crashes after DLQ publication but before committing the original offset.
+
+Permanent database errors, DLQ replay, monitoring, and broader production recovery policies remain future work.
+
 ## Concepts demonstrated
 
 | Concept | What we observed |
@@ -427,6 +563,11 @@ This demonstrates **at-least-once processing with idempotent database writes**, 
 | Idempotency | Duplicate `event_id` values did not create duplicate rows |
 | Crash recovery | Kafka redelivered an uncommitted event after restart |
 | At-least-once processing | PostgreSQL insert succeeded before a crash; replay was handled safely |
+| Database retries | Transient PostgreSQL failures retried with bounded exponential backoff |
+| Error classification | Retryable and non-retryable PostgreSQL errors handled differently |
+| Kafka commit failures | Commit errors logged explicitly; consumer exits without continuing |
+| Dead-letter queue | Invalid GPS telemetry preserved in a separate Kafka topic |
+| DLQ diagnostic headers | Original topic, partition, offset, and failure reason preserved |
 
 ## Kafka vs. NATS JetStream — learning comparison
 
@@ -444,19 +585,18 @@ These are conceptual comparisons, not exact feature equivalences.
 - Kafka runs as a single broker with replication factor 1, without broker-failure tolerance.
 - The producer emits a fixed sample event rather than generating unique event identifiers automatically.
 - PostgreSQL must be configured separately; it is not included in this repository's Docker Compose setup.
-- Database failures currently terminate the consumer rather than being handled through a retry strategy.
-- Malformed JSON is logged without a dead-letter topic or explicit poison-message policy.
+- PostgreSQL retries are bounded and limited to selected transient errors; exhausted retries terminate the consumer.
+- The DLQ currently handles JSON deserialization failures, not all permanently failing database operations.
+- DLQ publication and source-offset commits are separate operations, so duplicate DLQ records are possible.
 - Idempotency is enforced for PostgreSQL inserts through `event_id` uniqueness; exactly-once behavior across arbitrary external side effects is not guaranteed.
 - Consumer observability, graceful shutdown, and production deployment remain future work.
 
 ## Planned milestones
 
-1. Implement consumer error handling and retry strategies for temporary PostgreSQL failures.
-2. Introduce dead-letter topics and policies for malformed or permanently failing records.
-3. Explore Kafka producer idempotence, transactions, delivery guarantees, and replication.
-4. Improve consumer lifecycle handling, graceful shutdown, and observability.
-5. Containerize the Rust producer and consumer.
-6. Deploy Kafka-connected Rust workloads on Kubernetes and study scaling and recovery.
+1. Explore Kafka producer idempotence, transactions, delivery guarantees, and replication.
+2. Improve consumer lifecycle handling, graceful shutdown, and observability.
+3. Containerize the Rust producer and consumer.
+4. Deploy Kafka-connected Rust workloads on Kubernetes and study scaling and recovery.
 
 ## Build checks
 

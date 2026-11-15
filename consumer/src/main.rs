@@ -1,6 +1,7 @@
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
-use rdkafka::message::Message;
+use rdkafka::message::{Header, Message, OwnedHeaders};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde::Deserialize;
 use sqlx::{PgPool, postgres::PgQueryResult};
 use tokio::time::{Duration, sleep};
@@ -40,6 +41,26 @@ async fn save_gps_event(
     .await
 }
 
+fn is_retryable_db_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_) => true,
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::PoolClosed => false,
+
+        sqlx::Error::Database(db_error) => {
+            matches!(
+                db_error.code().as_deref(),
+                Some("40001") | // Serialization failure
+                Some("40P01") | // Deadlock detected
+                Some("53300") | // Too many connections
+                Some("57P03") // Cannot connect now
+            )
+        }
+
+        _ => false,
+    }
+}
+
 async fn save_gps_event_with_retry(
     pool: &PgPool,
     telemetry: &GpsTelemetry,
@@ -51,6 +72,15 @@ async fn save_gps_event_with_retry(
             Ok(result) => return Ok(result),
 
             Err(error) => {
+                if !is_retryable_db_error(&error) {
+                    eprintln!(
+                        "Non-retryable PostgreSQL error. Stopping consumer: {}",
+                        error
+                    );
+
+                    return Err(error);
+                }
+
                 if attempt == MAX_RETRIES {
                     eprintln!(
                         "PostgreSQL operation failed after {} attempts: {}",
@@ -79,13 +109,62 @@ async fn save_gps_event_with_retry(
     unreachable!("Retry loop must return success or error")
 }
 
+async fn publish_to_dlq(
+    producer: &FutureProducer,
+    payload: &[u8],
+    partition: i32,
+    offset: i64,
+    failure_reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = format!("{partition}-{offset}");
+
+    let headers = OwnedHeaders::new()
+        .insert(Header {
+            key: "source_topic",
+            value: Some("orbi.gps.location"),
+        })
+        .insert(Header {
+            key: "source_partition",
+            value: Some(partition.to_string().as_str()),
+        })
+        .insert(Header {
+            key: "source_offset",
+            value: Some(offset.to_string().as_str()),
+        })
+        .insert(Header {
+            key: "failure_reason",
+            value: Some(failure_reason),
+        });
+
+    let record = FutureRecord::to("orbi.gps.location.dlq")
+        .key(&key)
+        .payload(payload)
+        .headers(headers);
+
+    match producer.send(record, Duration::from_secs(10)).await {
+        Ok(delivery) => {
+            println!(
+                "Message published to DLQ: partition={}, offset={}",
+                delivery.partition, delivery.offset
+            );
+            Ok(())
+        }
+        Err((error, _)) => {
+            eprintln!("Failed to publish message to DLQ: {error}");
+            Err(error.into())
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+
     let database_url = std::env::var("DATABASE_URL")?;
 
     let pool = PgPool::connect(&database_url).await?;
 
-    println!("PostgreSQL connection pool initialized (lazy connection)");
+    println!("PostgreSQL connection pool initialized");
 
     // 1. Configure the Kafka consumer.
     let consumer: StreamConsumer = ClientConfig::new()
@@ -100,6 +179,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     consumer.subscribe(&["orbi.gps.location"])?;
 
     println!("Kafka GPS consumer started. Waiting for messages...");
+
+    // Producer used to publish invalid GPS messages to the DLQ.
+    let dlq_producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .set("acks", "all")
+        .create()?;
+
+    println!("Kafka DLQ producer initialized");
 
     // 3. Continuously receive messages.
     loop {
@@ -134,12 +221,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("Duplicate GPS event detected — insert skipped");
                         }
 
-                        consumer.commit_message(&message, CommitMode::Sync)?;
+                        match consumer.commit_message(&message, CommitMode::Sync) {
+                            Ok(()) => {
+                                println!(
+                                    "Kafka offset committed successfully: partition={}, next_offset={}",
+                                    partition,
+                                    offset + 1
+                                );
+                            }
 
-                        println!("Kafka offset committed successfully");
+                            Err(error) => {
+                                eprintln!(
+                                    "Kafka offset commit failed: partition={}, offset={}, error={}",
+                                    partition, offset, error
+                                );
+
+                                return Err(error.into());
+                            }
+                        }
                     }
                     Err(error) => {
-                        eprintln!("Failed to deserialize GPS event: {error}");
+                        eprintln!(
+                            "Failed to deserialize GPS event: partition={}, offset={}, error={}",
+                            partition, offset, error
+                        );
+
+                        // Preserve the invalid message in the dead-letter queue.
+                        publish_to_dlq(
+                            &dlq_producer,
+                            payload,
+                            partition,
+                            offset,
+                            &error.to_string(),
+                        )
+                        .await?;
+
+                        // Commit only after Kafka acknowledges DLQ delivery.
+                        consumer.commit_message(&message, CommitMode::Sync)?;
+
+                        println!(
+                            "Invalid GPS event safely moved to DLQ. Original partition={}, next_offset={}",
+                            partition,
+                            offset + 1
+                        );
                     }
                 }
             }
