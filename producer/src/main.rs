@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
         .set("acks", "all")
+        .set("enable.idempotence", "true")
         .create()?;
 
     // 4. Construct the Kafka record.
