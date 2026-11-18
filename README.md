@@ -4,7 +4,7 @@ Hands-on Apache Kafka distributed messaging lab using Rust, Tokio, and rdkafka.
 
 This repository is a progressive learning lab for Kafka's distributed messaging model. The goal is to understand how producers, partitions, consumer groups, and offset management work by implementing and testing them in Rust.
 
-> **Status:** Milestones 1–4 complete — Rust producer and consumer, consumer-group rebalancing, manual offset commits, PostgreSQL persistence, idempotent processing, crash recovery, bounded database retries, and dead-letter queue handling. This is a learning lab, not a production-ready messaging service.
+> **Status:** Milestones 1–5 complete — Rust producer and consumer, consumer-group rebalancing, manual offset commits, PostgreSQL persistence, idempotent processing, crash recovery, bounded database retries, dead-letter queue handling, producer idempotence, and Kafka transactions. This is a learning lab, not a production-ready messaging service.
 
 ## Technology stack
 
@@ -543,6 +543,135 @@ This implementation does not provide exactly-once processing across PostgreSQL a
 
 Permanent database errors, DLQ replay, monitoring, and broader production recovery policies remain future work.
 
+## Milestone 5 — Producer idempotence and Kafka transactions
+
+This milestone explores Kafka producer delivery guarantees, idempotence, transactional publishing, consumer isolation levels, and transaction error handling using Rust and `rdkafka`.
+
+### Producer idempotence
+
+The standard Rust GPS producer was configured with:
+
+```rust
+.set("enable.idempotence", "true")
+.set("acks", "all")
+```
+
+Producer idempotence allows Kafka to deduplicate eligible producer retries using producer identity and sequence numbers.
+
+It does not deduplicate separate application-level publications that happen to contain the same `event_id`.
+
+### Transactional producer
+
+A separate binary was created:
+
+`producer/src/bin/transactional_producer.rs`
+
+The transactional producer uses:
+
+- `FutureProducer` and `FutureRecord`.
+- A configured `transactional.id`.
+- Producer idempotence.
+- `init_transactions()`.
+- `begin_transaction()`.
+- `commit_transaction()`.
+- `abort_transaction()`.
+
+Two Kafka topics were created:
+
+| Topic | Partitions | Purpose |
+| --- | --- | --- |
+| `gps.enriched` | 3 | Enriched GPS telemetry |
+| `gps.audit` | 3 | GPS processing audit events |
+
+Both topics use replication factor 1 in the local single-node Kafka environment.
+
+Run the transactional producer:
+
+```bash
+cargo run -p producer --bin transactional_producer
+```
+
+### Experiment 1 — Atomic transaction commit
+
+The producer published two records in one Kafka transaction:
+
+1. An enriched GPS event to `gps.enriched`.
+2. A corresponding audit event to `gps.audit`.
+
+Kafka acknowledged both deliveries, and the transaction was committed successfully.
+
+Independent Kafka console consumers using `read_committed` retrieved both records.
+
+This verified committed transaction visibility across two Kafka topics.
+
+### Experiment 2 — Transaction abort
+
+The producer was modified to publish two records and then explicitly call `abort_transaction()`.
+
+The experiment used two logical event IDs:
+
+- `GPS-TX-001` — committed transaction.
+- `GPS-TX-002` — aborted transaction.
+
+The transaction abort completed successfully even though both records had previously received delivery acknowledgments.
+
+### Experiment 3 — Consumer isolation
+
+Kafka console consumers were used to compare transaction isolation levels.
+
+| Isolation level | `GPS-TX-001` committed | `GPS-TX-002` aborted |
+| --- | --- | --- |
+| `read_committed` | Visible | Hidden |
+| `read_uncommitted` | Visible | Visible |
+
+The experiments demonstrated that Kafka can retain records from aborted transactions while excluding them from `read_committed` consumption.
+
+The isolation setting is important for downstream services that must avoid processing aborted transactional records.
+
+### Transaction error handling
+
+The transactional Rust producer was extended with:
+
+- Explicit publication failure handling for both GPS and audit records.
+- Transaction error classification into `Retry`, `Abort`, `Fatal`, and `Unknown`.
+- Inspection of transaction-specific `librdkafka` error information.
+- Bounded commit retries, with a maximum of three attempts.
+- Explicit abort handling for abort-required transaction errors.
+- Conservative handling of unclassified publication errors.
+- Logging of delivery partitions, offsets, and commit attempts.
+
+A successful run confirmed that both publications were acknowledged and the transaction committed on the first attempt.
+
+The error-handling branches compiled successfully, but the different failure classifications have not all been exercised through controlled failure experiments.
+
+### Key learning outcomes
+
+Kafka transactions can atomically commit records written to multiple Kafka topics and partitions.
+
+For `read_committed` consumers, aborted transactional records are excluded from normal consumption.
+
+Producer idempotence and Kafka transactions address different problems:
+
+- **Producer idempotence:** Prevents duplicate records caused by eligible producer retries.
+- **Kafka transactions:** Provide atomic visibility for related Kafka operations.
+- **Application-level idempotency:** Prevents repeated logical events from causing duplicate effects.
+
+Kafka transactions do not automatically include external PostgreSQL writes.
+
+The existing PostgreSQL consumer continues to use at-least-once processing with idempotent database persistence.
+
+### Remaining work
+
+The transactional producer is an educational implementation, not a complete production-ready transaction recovery system.
+
+Remaining work includes:
+
+- More comprehensive handling of retriable, abortable, fatal, and ambiguous transaction errors.
+- Controlled failure testing of transaction recovery paths.
+- Transactional consumer processing with Kafka offsets committed inside producer transactions.
+- Consumer isolation configuration for transactional processing.
+- Exactly-once Kafka consume-transform-produce experiments.
+
 ## Concepts demonstrated
 
 | Concept | What we observed |
@@ -568,6 +697,11 @@ Permanent database errors, DLQ replay, monitoring, and broader production recove
 | Kafka commit failures | Commit errors logged explicitly; consumer exits without continuing |
 | Dead-letter queue | Invalid GPS telemetry preserved in a separate Kafka topic |
 | DLQ diagnostic headers | Original topic, partition, offset, and failure reason preserved |
+| Producer idempotence | Enabled idempotent delivery for the Rust GPS producer |
+| Kafka transactions | GPS and audit records committed atomically across topics |
+| Transaction abort | Aborted records excluded from `read_committed` consumption |
+| Consumer isolation | Verified `read_committed` versus `read_uncommitted` behavior |
+| Transaction recovery | Added bounded commit retries and classified error-handling paths |
 
 ## Kafka vs. NATS JetStream — learning comparison
 
@@ -593,10 +727,11 @@ These are conceptual comparisons, not exact feature equivalences.
 
 ## Planned milestones
 
-1. Explore Kafka producer idempotence, transactions, delivery guarantees, and replication.
-2. Improve consumer lifecycle handling, graceful shutdown, and observability.
-3. Containerize the Rust producer and consumer.
-4. Deploy Kafka-connected Rust workloads on Kubernetes and study scaling and recovery.
+1. Implement Kafka transactional consume-transform-produce processing with atomic offset commits.
+2. Explore replication, delivery guarantees, and controlled transaction failure recovery.
+3. Improve consumer lifecycle handling, graceful shutdown, and observability.
+4. Containerize the Rust producer and consumer.
+5. Deploy Kafka-connected Rust workloads on Kubernetes and study scaling and recovery.
 
 ## Build checks
 
